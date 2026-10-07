@@ -1,0 +1,43 @@
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainJob
+metadata:
+  # SMOKE: whole pipeline (IDGC -> infer x{best,latest} -> QGC x2 -> test x{best,latest} = 4 results)
+  # on 256/64 samples, 2 epochs per training -> Experiments/pipeline_smoke
+  # Stage logic lives in kubeflow/run_pipeline.sh (runs from the PVC, no rebuild needed).
+  name: gys-pipeline-smoke
+  namespace: kbm-g-np-postech-a
+spec:
+  runtimeRef:
+    apiGroup: trainer.kubeflow.org
+    kind: TrainingRuntime
+    name: pointgrasp
+  trainer:
+    image: postech-a.kr-central-2.kcr.dev/dmsgk724/grasp-as-you-say:latest
+    numNodes: 1
+    numProcPerNode: 1
+    resourcesPerNode:
+      limits: {cpu: "16", memory: 128Gi, nvidia.com/gpu: "1"}
+    env:
+      - {name: PYTHONUNBUFFERED, value: "1"}
+      # train.py logs to wandb (run name = save_root dir, e.g. idgc / qgc_from_idgc_best)
+      - {name: WANDB_API_KEY, valueFrom: {secretKeyRef: {name: wandb-secret-eunha, key: api-key}}}
+      - {name: WANDB_PROJECT, value: "grasp-as-you-say-smoke"}
+      - {name: SMOKE, value: "1"}
+    command: [/bin/bash]
+    args:
+      - "-lc"
+      - |-
+        set -euo pipefail
+        nvidia-smi -L || true
+        cd /workspace/users/dmsgk724/Grasp-as-You-Say
+        bash kubeflow/run_pipeline.sh
+  podTemplateOverrides:
+    - targetJobs: [{name: node}]
+      metadata: {annotations: {sidecar.istio.io/inject: "false"}}
+      spec:
+        containers:
+          - name: node
+            volumeMounts: [{mountPath: /workspace, name: workspace}, {mountPath: /dev/shm, name: dshm}]
+        volumes:
+          - {name: workspace, persistentVolumeClaim: {claimName: cholab}}
+          - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 32Gi}}

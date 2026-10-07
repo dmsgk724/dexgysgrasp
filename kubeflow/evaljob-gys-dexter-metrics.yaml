@@ -1,0 +1,67 @@
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainJob
+metadata:
+  # Computational metrics of the DexGYS reproduction (IDGC best × QGC latest), scored
+  # with dexter_temp's DexGYS benchmark exactly as dexter is scored:
+  #   chamfer -> hand_chamfer (CD), cmap (contact map)
+  #   q1      -> valid_q1 (Q1), mean_pen (penetration), + q1.csv (per-grasp pen -> max<5mm)
+  #   fid     -> fid (P-FID; point-e pointnet from dexter_temp/point_e_model_cache)
+  # Inputs (dexter predictions.json schema), results are written next to each file:
+  #   Experiments/eval/idgc_best__qgc_latest/all/predictions.json        (9971, 326 objs)
+  #   Experiments/eval/idgc_best__qgc_latest/dexter309/predictions.json  (9102, dexter's 309 objs)
+  name: gys-eval-dexter-metrics
+  namespace: kbm-g-np-postech-a
+spec:
+  runtimeRef:
+    apiGroup: trainer.kubeflow.org
+    kind: TrainingRuntime
+    name: dexter-runtime
+  podTemplateOverrides:
+  - targetJobs:
+    - name: node
+    metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      containers:
+      - name: node
+        volumeMounts:
+        - {mountPath: /workspace, name: workspace}
+        - {mountPath: /dev/shm, name: dshm}
+      volumes:
+      - {name: workspace, persistentVolumeClaim: {claimName: cholab}}
+      - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 64Gi}}
+  trainer:
+    image: postech-a.kr-central-2.kcr.dev/dmsgk724/dexter:87c1e1d
+    numNodes: 1
+    numProcPerNode: 1
+    resourcesPerNode:
+      limits: {cpu: "16", memory: 128Gi, nvidia.com/gpu: "1"}
+    env:
+    - {name: HF_HOME, value: /workspace/users/dmsgk724/hf_cache}
+    - {name: PYTHONUNBUFFERED, value: "1"}
+    args:
+    - /bin/bash
+    - -lc
+    - |-
+      set -eo pipefail
+      source /python/.venv/bin/activate
+      E=/workspace/users/dmsgk724/Grasp-as-You-Say/Experiments/eval/idgc_best__qgc_latest
+      trap 'chown -R 1000:100 $E 2>/dev/null || true' EXIT
+      cd /workspace/users/dmsgk724/dexter_temp
+      git config --global --add safe.directory '*'
+      git log -1 --oneline
+      nvidia-smi --query-gpu=name --format=csv,noheader
+      uv pip install -e .
+      DATA=/workspace/datasets/dexterp/dexgys_final
+
+      for SET in dexter309 all; do
+        PRED=$E/$SET/predictions.json
+        echo "=================== $SET ($(date '+%F %T')) ==================="
+        python -m benchmark.dexgys.chamfer --pred-path $PRED --data-path $DATA --gpu 0 --parallel 16
+        python -m benchmark.dexgys.q1      --pred-path $PRED --data-path $DATA --gpu 0 --parallel 16
+        python -c "import csv,sys; p=[float(r['pen']) for r in csv.DictReader(open(sys.argv[1]))]; print(f'Q1 max<5mm {sum(x<0.005 for x in p)/len(p)*100:.2f}% (n={len(p)})')" $E/$SET/q1.csv
+        python -m benchmark.dexgys.fid     --pred-path $PRED --data-path $DATA
+        echo "--- $SET metrics.json"; cat $E/$SET/metrics.json
+      done
+      echo "EVAL DONE"

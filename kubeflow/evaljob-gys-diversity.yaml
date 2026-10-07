@@ -1,0 +1,39 @@
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainJob
+metadata:
+  # Diversity of IDGC best x QGC latest (DexGYS paper protocol): 8 seeded IDGC samples per
+  # input, each refined by QGC, then std of translation (cm) / rotation, joints (Euler deg).
+  # Logic: kubeflow/run_diversity.sh -> Experiments/eval/idgc_best__qgc_latest/diversity/
+  name: gys-eval-diversity
+  namespace: kbm-g-np-postech-a
+spec:
+  runtimeRef:
+    apiGroup: trainer.kubeflow.org
+    kind: TrainingRuntime
+    name: pointgrasp
+  trainer:
+    image: postech-a.kr-central-2.kcr.dev/dmsgk724/grasp-as-you-say:latest
+    numNodes: 1
+    numProcPerNode: 1
+    resourcesPerNode:
+      limits: {cpu: "16", memory: 128Gi, nvidia.com/gpu: "1"}
+    env:
+      - {name: PYTHONUNBUFFERED, value: "1"}
+    command: [/bin/bash]
+    args:
+      - "-lc"
+      - |-
+        set -euo pipefail
+        nvidia-smi -L || true
+        cd /workspace/users/dmsgk724/Grasp-as-You-Say
+        bash kubeflow/run_diversity.sh
+  podTemplateOverrides:
+    - targetJobs: [{name: node}]
+      metadata: {annotations: {sidecar.istio.io/inject: "false"}}
+      spec:
+        containers:
+          - name: node
+            volumeMounts: [{mountPath: /workspace, name: workspace}, {mountPath: /dev/shm, name: dshm}]
+        volumes:
+          - {name: workspace, persistentVolumeClaim: {claimName: cholab}}
+          - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 32Gi}}

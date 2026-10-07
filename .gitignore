@@ -14,3 +14,11 @@ Experiments/
 data
 
 point_e_model_cache
+
+# docker build inputs fetched on the host (see Dockerfile.gys)
+docker_cache/
+
+# local build artifacts (CSDF is cloned + built inside Dockerfile.gys)
+thirdparty/CSDF/
+thirdparty/pointnet2/build/
+*.egg-info/

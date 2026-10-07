@@ -1,0 +1,99 @@
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainJob
+metadata:
+  # SMOKE: end-to-end gate for the Grasp-as-You-Say image on the cluster GPU.
+  #   1) GPU kernels: pointnet2 FPS, CSDF compute_sdf, pytorch3d knn run on-device
+  #      (catches a missing sm_100/sm_120 arch in the compiled extensions).
+  #   2) IDGC (config/idgc.yaml) for 1 epoch on a 256/64-sample subset of
+  #      DexGYS -> dataset + CLIP + PointNet2 + hand-model loss forward/backward,
+  #      validation, checkpoint save.
+  # data/ is symlinked into /workspace/datasets/dexterp/dexgys_final (relative
+  # links, valid both in the notebook and in the pod); data/mjcf is the
+  # UniDexGrasp ShadowHand MJCF.
+  name: gys-idgc-smoke
+  namespace: kbm-g-np-postech-a
+spec:
+  runtimeRef:
+    apiGroup: trainer.kubeflow.org
+    kind: TrainingRuntime
+    name: pointgrasp
+  trainer:
+    image: postech-a.kr-central-2.kcr.dev/dmsgk724/grasp-as-you-say:latest
+    numNodes: 1
+    numProcPerNode: 1
+    resourcesPerNode:
+      limits: {cpu: "8", memory: 64Gi, nvidia.com/gpu: "1"}
+    env:
+      - {name: PYTHONUNBUFFERED, value: "1"}
+    command: [/bin/bash]
+    args:
+      - "-lc"
+      - |-
+        set -euo pipefail
+        nvidia-smi -L || true
+        cd /workspace/users/dmsgk724/Grasp-as-You-Say
+        for f in data/dexgys/train.json data/dexgys/test.json data/oakink/shape/metaV2/object_id.json \
+                 data/mjcf/shadow_hand.xml data/mjcf/contact_points.json data/mjcf/penetration_points.json; do
+          test -f "$f" || { echo "ERROR: missing $f"; exit 1; }
+        done
+
+        echo "=== [1/2] GPU kernel check ==="
+        python - <<'PY'
+        import sys, torch
+        sys.path.insert(0, "thirdparty/pointnet2")
+        assert torch.cuda.is_available(), "no CUDA device"
+        cap = torch.cuda.get_device_capability()
+        print("device", torch.cuda.get_device_name(), "sm_%d%d" % cap, "torch", torch.__version__)
+        dev = "cuda"
+        import pointnet2_utils
+        xyz = torch.rand(2, 2048, 3, device=dev)
+        idx = pointnet2_utils.furthest_point_sample(xyz, 256)
+        assert idx.shape == (2, 256)
+        import csdf, trimesh
+        m = trimesh.creation.icosphere(subdivisions=2)
+        fv = csdf.index_vertices_by_faces(torch.tensor(m.vertices, dtype=torch.float, device=dev),
+                                          torch.tensor(m.faces, dtype=torch.long, device=dev))
+        d, *_ = csdf.compute_sdf(torch.zeros(1, 3, device=dev), fv)
+        # compute_sdf returns the SQUARED distance; from the centre the closest
+        # point is a face interior, so the exact answer is the min face-plane
+        # distance (0.9822 for subdiv 2, not 1.0: flat faces sit inside r=1).
+        import numpy as np
+        ref = np.abs((m.face_normals * m.triangles[:, 0]).sum(1)).min()
+        assert abs(d.item() - ref ** 2) < 1e-4, (d.item(), ref ** 2)
+        from pytorch3d.ops import knn_points
+        knn = knn_points(xyz, xyz, K=4)
+        assert knn.idx.shape == (2, 2048, 4)
+        torch.cuda.synchronize()
+        print("pointnet2 / csdf / pytorch3d kernels OK")
+        PY
+
+        echo "=== [2/2] IDGC 1-epoch smoke ==="
+        python - <<'PY'
+        import json, yaml
+        cfg = yaml.safe_load(open("config/idgc.yaml"))
+        for split, src, n in [("train", "data/dexgys/train.json", 256), ("val", "data/dexgys/test.json", 64)]:
+            sub = json.load(open(src))[:n]
+            json.dump(sub, open(f"/tmp/smoke_{split}.json", "w"))
+            cfg["data"][split]["pose_path"] = f"/tmp/smoke_{split}.json"
+            cfg["data"][split]["batch_size"] = 16
+            cfg["data"][split]["num_workers"] = 2
+        cfg.update(epochs=1, validate_freq=1, print_freq=4, save_top_n=1,
+                   save_root="./Experiments/smoke_idgc")
+        cfg["scheduler"]["t_max"] = 1
+        yaml.safe_dump(cfg, open("/tmp/smoke_idgc.yaml", "w"), sort_keys=False)
+        PY
+        rm -rf ./Experiments/smoke_idgc
+        python train.py -t /tmp/smoke_idgc.yaml
+        ls -la ./Experiments/smoke_idgc
+        ls ./Experiments/smoke_idgc/*.pth >/dev/null || { echo "ERROR: no checkpoint saved"; exit 1; }
+        echo "=== SMOKE OK ==="
+  podTemplateOverrides:
+    - targetJobs: [{name: node}]
+      metadata: {annotations: {sidecar.istio.io/inject: "false"}}
+      spec:
+        containers:
+          - name: node
+            volumeMounts: [{mountPath: /workspace, name: workspace}, {mountPath: /dev/shm, name: dshm}]
+        volumes:
+          - {name: workspace, persistentVolumeClaim: {claimName: cholab}}
+          - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 32Gi}}

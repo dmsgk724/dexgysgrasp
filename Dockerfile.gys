@@ -1,0 +1,103 @@
+# syntax=docker/dockerfile:1.7
+#
+# Grasp-as-You-Say (DexGYS) image -- environment only.
+#
+# Jobs run the repo from the PVC (cd /workspace/users/dmsgk724/Grasp-as-You-Say),
+# so code changes never need a rebuild; this image just ships the python env
+# plus the compiled CUDA extensions.
+#
+# Deviations from the README (torch 1.10 + cu113 + py3.8):
+#   * torch 2.7.1+cu128 / python 3.10 -- Blackwell (B200 sm_100, RTX 50xx
+#     sm_120) needs CUDA >= 12.8; cu113 cannot run there. torch 2.7 dropped py3.8.
+#   * numpy pinned to 1.26.4 -- scipy 1.10 / healpy 1.16 pins break on numpy 2.
+#   * pytorch3d v0.7.9 from source instead of v0.7.2 (v0.7.2 predates torch 2.x).
+#   * setuptools < 70 -- CSDF's setup.py still imports pkg_resources.
+#   * CSDF: CHECK_EQ (glog, no longer pulled in by torch headers) ->
+#     TORCH_CHECK_EQ, same patch as PointGrasp/thirdparty/csdf.
+#   * CLIP ViT-L/14 weights baked in so pods need no internet for it. They are
+#     COPY'd from the host because the CLIP CDN (openaipublic.azureedge.net)
+#     times out from inside docker build containers here (host-only route).
+#
+# Build:
+#     mkdir -p docker_cache/clip && curl -fL -o docker_cache/clip/ViT-L-14.pt \
+#         https://openaipublic.azureedge.net/clip/models/b8cca3fd41ae0c99ba7e8951adf17d267cdb84cd88be6f7c2e0eca1737a03836/ViT-L-14.pt
+#     docker build -f Dockerfile.gys \
+#         -t postech-a.kr-central-2.kcr.dev/dmsgk724/grasp-as-you-say:latest .
+#     docker push postech-a.kr-central-2.kcr.dev/dmsgk724/grasp-as-you-say:latest
+
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    UV_LINK_MODE=copy \
+    # CUDA extensions: no GPU is visible during docker build, so force the
+    # CUDA build and give an explicit arch list (A100, H100, B200, RTX 50xx).
+    CUDA_HOME=/usr/local/cuda \
+    FORCE_CUDA=1 \
+    TORCH_CUDA_ARCH_LIST="8.0;8.6;9.0;10.0;12.0" \
+    MAX_JOBS=32
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates git build-essential ninja-build \
+        libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---- uv (manages a standalone python 3.10) ----
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && mv /root/.local/bin/uv /root/.local/bin/uvx /usr/local/bin/
+
+# Install under /opt, NOT /workspace: the cholab PVC is mounted at /workspace
+# at runtime and would shadow anything placed there.
+WORKDIR /opt/gys
+RUN uv venv --python 3.10 /opt/gys/.venv
+ENV PATH="/opt/gys/.venv/bin:$PATH" \
+    VIRTUAL_ENV=/opt/gys/.venv
+
+# ---- torch (cu128, matches the base image's nvcc 12.8) ----
+RUN uv pip install torch==2.7.1 torchvision==0.22.1 \
+        --index-url https://download.pytorch.org/whl/cu128
+
+# ---- python deps (requirements.txt minus pytorch3d, which is built below) ----
+COPY requirements.txt /opt/gys/requirements.txt
+RUN grep -v pytorch3d requirements.txt > /tmp/req.txt \
+    && uv pip install "numpy==1.26.4" "setuptools<70" wheel \
+        -r /tmp/req.txt \
+        transformations absl-py plyfile six pyyaml
+
+# ---- pytorch3d (CUDA ops: knn, chamfer, ...) ----
+RUN uv pip install --no-build-isolation \
+        "git+https://github.com/facebookresearch/pytorch3d.git@v0.7.9"
+
+# ---- vendored thirdparty: pytorch_kinematics (pure python) + pointnet2 (CUDA) ----
+COPY thirdparty/pytorch_kinematics /opt/gys/thirdparty/pytorch_kinematics
+COPY thirdparty/pointnet2 /opt/gys/thirdparty/pointnet2
+# pytorch_kinematics goes in editable (-e, like the README): its setup.py lists
+# only the top-level package, so a regular install drops urdf_parser_py/,
+# mjcf_parser/ and transforms/.
+RUN uv pip install --no-build-isolation -e /opt/gys/thirdparty/pytorch_kinematics \
+    && uv pip install --no-build-isolation /opt/gys/thirdparty/pointnet2
+
+# ---- CSDF (CUDA), pinned + patched ----
+RUN git clone https://github.com/wrc042/CSDF.git /opt/gys/thirdparty/CSDF \
+    && cd /opt/gys/thirdparty/CSDF \
+    && git checkout 41ce6052786d9a93f446d71531eddf6f4a4f1ece \
+    && sed -i 's/\bCHECK_EQ(error, cudaSuccess)/TORCH_CHECK_EQ(error, cudaSuccess)/' csdf/csrc/utils.h \
+    && uv pip install --no-build-isolation .
+
+# ---- CLIP ViT-L/14 weights (config/idgc.yaml) into the default cache ----
+# clip.load() checks the sha256 embedded in its URL, so a bad copy fails here.
+COPY docker_cache/clip/ViT-L-14.pt /root/.cache/clip/ViT-L-14.pt
+RUN python -c "import clip; clip.load('ViT-L/14', jit=False, device='cpu')"
+
+# ---- wandb (train.py logs to it when WANDB_API_KEY is set; mirrors tensorboard) ----
+# own late layer so adding it did not invalidate the pytorch3d/CSDF build cache
+RUN uv pip install "wandb==0.22.3"
+
+# smoke: every import + the extensions' compiled .so files resolve
+RUN python -c "import torch, pytorch3d, pytorch3d.ops, pytorch_kinematics, csdf, clip, \
+trimesh, scipy, healpy, hydra, omegaconf, einops, transforms3d, lxml, UMNN, wandb; \
+import pointnet2._ext, csdf._C, pytorch3d._C; \
+print('GYS env OK, torch', torch.__version__, 'pytorch3d', pytorch3d.__version__)"
+
+WORKDIR /workspace

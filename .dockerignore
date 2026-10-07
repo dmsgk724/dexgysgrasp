@@ -1,0 +1,9 @@
+# The image only needs requirements.txt and the vendored thirdparty sources.
+*
+!requirements.txt
+!thirdparty/pytorch_kinematics
+!thirdparty/pointnet2
+!docker_cache/clip/ViT-L-14.pt
+thirdparty/pointnet2/build
+**/__pycache__
+**/*.egg-info
