@@ -86,6 +86,18 @@ class Trainer(object):
         if not osp.exists(self.log_path):
             os.makedirs(self.log_path)
 
+        # optional wandb: mirrors the tensorboard scalars (sync_tensorboard must be
+        # set up before the SummaryWriter is created). Enabled only if WANDB_API_KEY is set.
+        if "WANDB_API_KEY" in os.environ:
+            import wandb
+            wandb.init(
+                project=os.environ.get("WANDB_PROJECT", "grasp-as-you-say"),
+                name=os.environ.get("WANDB_NAME", osp.basename(osp.normpath(self.save_root))),
+                config=cfg.dict(),
+                dir=self.save_root,
+                sync_tensorboard=True,
+            )
+
         self.logger = SummaryWriter(log_dir=self.log_path)  # tensorboard logger
         self._init_train_logger()  # global Logging.logger
         self._record_cfg(cfg)
@@ -528,3 +540,6 @@ if __name__ == "__main__":
     pt_trainer = Trainer(train_cfg)
     pt_trainer.back_up()
     pt_trainer.train()
+    if "WANDB_API_KEY" in os.environ:
+        import wandb
+        wandb.finish()
